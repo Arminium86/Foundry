@@ -260,31 +260,43 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
         br2 = UCase$(Trim$(CStr(brand2Arr(r, 1))))
         If br2 = "" Then GoTo NextRow
 
-        If br <> "FL" And br2 <> br Then GoTo NextRow
-
         Dim per As Long
         per = CLng(Val(yearArr(r, 1)))
         If per <= 0 Then GoTo NextRow
 
         If br = "WASTE" Or br2 = "WASTE" Then GoTo NextRow
 
+        If br <> "FL" And br2 <> br Then GoTo NextRow
+
+        Dim k As String
         Dim baseVal As Double
+
         If br = "FL" Then
-            If br2 = "FL" Then
-                baseVal = NzNum(twLArr(r, 1))
+            baseVal = NzNum(twLArr(r, 1))
+            k = scen & "|" & opf & "|" & br & "|" & CStr(per)
+            If sums.Exists(k) Then
+                sums(k) = CDbl(sums(k)) + baseVal
             Else
+                sums(k) = baseVal
+            End If
+
+            If br2 <> "FL" Then
                 baseVal = NzNum(twFArr(r, 1))
+                k = scen & "|" & opf & "|" & br2 & "|" & CStr(per)
+                If sums.Exists(k) Then
+                    sums(k) = CDbl(sums(k)) + baseVal
+                Else
+                    sums(k) = baseVal
+                End If
             End If
         Else
             baseVal = NzNum(twFArr(r, 1))
-        End If
-
-        Dim k As String
-        k = scen & "|" & opf & "|" & br2 & "|" & CStr(per)
-        If sums.Exists(k) Then
-            sums(k) = CDbl(sums(k)) + baseVal
-        Else
-            sums(k) = baseVal
+            k = scen & "|" & opf & "|" & br & "|" & CStr(per)
+            If sums.Exists(k) Then
+                sums(k) = CDbl(sums(k)) + baseVal
+            Else
+                sums(k) = baseVal
+            End If
         End If
 NextRow:
     Next r

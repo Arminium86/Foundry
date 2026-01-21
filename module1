@@ -163,7 +163,10 @@ NextName:
     ' ---- 4) Apply FL fines allocation to brand2 ----
     ApplyFLFinesAllocationToBrand2 ThisWorkbook, wsTmp, colBrand2, colYear, 2, finalLastRow
 
-    ' ---- 5) Append Buffer_Abs_Export ONCE PER SCENARIO ----
+    ' ---- 5) Populate Buffer_Abs_Export from results ----
+    PopulateBufferAbsExportFromResults ThisWorkbook, wsTmp
+
+    ' ---- 6) Append Buffer_Abs_Export (scenario-specific) ----
     AppendBufferAbsExportPerScenario ThisWorkbook, wsTmp, scenUsed, dictMap
 
     ' Recalculate last row and re-apply FL mapping (covers appended rows too)
@@ -173,7 +176,7 @@ NextName:
         ApplyFLFinesAllocationToBrand2 ThisWorkbook, wsTmp, colBrand2, colYear, finalLastRow + 1, lastRowAfterAppend
     End If
 
-    ' ---- 6) Export CSV ----
+    ' ---- 7) Export CSV ----
     Dim savePath As Variant
     savePath = Application.GetSaveAsFilename( _
         InitialFileName:=GetDesktopPath() & "\Combined_" & Format(Now, "yyyymmdd_hhnnss") & ".csv", _
@@ -200,7 +203,173 @@ CleanUp:
 End Sub
 
 '================================================================================
-' Buffer append: Buffer_Abs_Export appended ONCE PER SCENARIO actually combined
+' Buffer build: calculate absolute buffer rows from results by scenario
+'================================================================================
+Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCombined As Worksheet)
+    Const SH_BUF As String = "Buffers & OPF Physical Caps"
+    Const TBL_BUF As String = "Buffer_Abs_Export"
+
+    Dim colScenario As Long, colOpfCode As Long, colBrand As Long, colYear As Long
+    Dim colTwF As Long, colTwL As Long
+
+    colScenario = FindHeaderColumn(wsCombined, "Scenario")
+    colOpfCode = FindHeaderColumn(wsCombined, "OPF Code")
+    colBrand = FindHeaderColumn(wsCombined, "brand")
+    colYear = FindHeaderColumn(wsCombined, "year")
+    colTwF = FindHeaderColumn(wsCombined, "port_tw@f")
+    colTwL = FindHeaderColumn(wsCombined, "port_tw@l")
+
+    If colScenario = 0 Or colOpfCode = 0 Or colBrand = 0 Or colYear = 0 Or colTwF = 0 Or colTwL = 0 Then
+        Err.Raise vbObjectError + 150, , "Combined sheet missing required columns for abs buffer calc."
+    End If
+
+    Dim lastRow As Long
+    lastRow = wsCombined.Cells(wsCombined.Rows.Count, colScenario).End(xlUp).Row
+    If lastRow < 2 Then Exit Sub
+
+    Dim scenArr As Variant, opfArr As Variant, brandArr As Variant
+    Dim yearArr As Variant, twFArr As Variant, twLArr As Variant
+    scenArr = wsCombined.Range(wsCombined.Cells(2, colScenario), wsCombined.Cells(lastRow, colScenario)).Value2
+    opfArr = wsCombined.Range(wsCombined.Cells(2, colOpfCode), wsCombined.Cells(lastRow, colOpfCode)).Value2
+    brandArr = wsCombined.Range(wsCombined.Cells(2, colBrand), wsCombined.Cells(lastRow, colBrand)).Value2
+    yearArr = wsCombined.Range(wsCombined.Cells(2, colYear), wsCombined.Cells(lastRow, colYear)).Value2
+    twFArr = wsCombined.Range(wsCombined.Cells(2, colTwF), wsCombined.Cells(lastRow, colTwF)).Value2
+    twLArr = wsCombined.Range(wsCombined.Cells(2, colTwL), wsCombined.Cells(lastRow, colTwL)).Value2
+
+    Dim sums As Object
+    Set sums = CreateObject("Scripting.Dictionary")
+    sums.CompareMode = vbTextCompare
+
+    Dim r As Long
+    For r = 1 To UBound(scenArr, 1)
+        Dim scen As String
+        scen = Trim$(CStr(scenArr(r, 1)))
+        If scen = "" Then GoTo NextRow
+
+        Dim opf As String
+        opf = Trim$(CStr(opfArr(r, 1)))
+        If opf = "" Then GoTo NextRow
+
+        Dim br As String
+        br = UCase$(Trim$(CStr(brandArr(r, 1))))
+        If br = "" Then GoTo NextRow
+
+        Dim per As Long
+        per = CLng(Val(yearArr(r, 1)))
+        If per <= 0 Then GoTo NextRow
+
+        Dim baseVal As Double
+        If br = "FL" Then
+            baseVal = NzNum(twLArr(r, 1))
+        Else
+            baseVal = NzNum(twFArr(r, 1))
+        End If
+
+        Dim k As String
+        k = scen & "|" & opf & "|" & br & "|" & CStr(per)
+        If sums.Exists(k) Then
+            sums(k) = CDbl(sums(k)) + baseVal
+        Else
+            sums(k) = baseVal
+        End If
+NextRow:
+    Next r
+
+    If sums.Count = 0 Then Exit Sub
+
+    Dim closingBuf As Object
+    Set closingBuf = LoadClosingBuffers(wb)
+
+    Dim addBuf As Object
+    Set addBuf = LoadAdditionalOpfBuffer(wb)
+
+    Dim perfPct As Double
+    perfPct = NormalizePct(LoadPerfectSolveBuffer(wb))
+
+    Dim wsBuf As Worksheet
+    On Error Resume Next
+    Set wsBuf = wb.Worksheets(SH_BUF)
+    On Error GoTo 0
+    If wsBuf Is Nothing Then Exit Sub
+
+    Dim lo As ListObject
+    On Error Resume Next
+    Set lo = wsBuf.ListObjects(TBL_BUF)
+    On Error GoTo 0
+
+    If lo Is Nothing Then
+        Dim startCell As Range
+        Set startCell = wsBuf.Range("A1")
+        startCell.Resize(1, 5).Value = Array("OPF_Bucket", "Brand", "Foundry_Period", "AbsBufferTonnes", "Scenario")
+        Set lo = wsBuf.ListObjects.Add(xlSrcRange, startCell.Resize(2, 5), , xlYes)
+        lo.Name = TBL_BUF
+    Else
+        EnsureTableColumn lo, "Scenario"
+        If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.Delete
+    End If
+
+    Dim cOPF As Long, cBrand As Long, cPer As Long, cAbs As Long, cScenario As Long
+    cOPF = GetLoColIndexAny(lo, Array("OPF", "OPF_Bucket"))
+    cBrand = GetLoColIndexAny(lo, Array("Brand"))
+    cPer = GetLoColIndexAny(lo, Array("Period", "Foundry_Period", "FOUNDRY_PERIOD"))
+    cAbs = GetLoColIndexAny(lo, Array("AbsBufferTonnes"))
+    cScenario = GetLoColIndexAny(lo, Array("Scenario"))
+
+    Dim outArr() As Variant
+    ReDim outArr(1 To sums.Count, 1 To lo.ListColumns.Count)
+
+    Dim i As Long
+    i = 0
+    Dim key As Variant
+    For Each key In sums.Keys
+        i = i + 1
+        Dim parts() As String
+        parts = Split(CStr(key), "|")
+
+        Dim opfKey As String
+        opfKey = UCase$(parts(1))
+        Dim brandKey As String
+        brandKey = UCase$(parts(2))
+        Dim periodKey As Long
+        periodKey = CLng(parts(3))
+
+        Dim addPct As Double
+        addPct = 0#
+        If addBuf.Exists(opfKey) Then addPct = NormalizePct(addBuf(opfKey))
+
+        Dim closeAbs As Double
+        closeAbs = 0#
+        If periodKey = 1 Then
+            Dim closeKey As String
+            closeKey = opfKey & brandKey
+            If closingBuf.Exists(closeKey) Then closeAbs = CDbl(closingBuf(closeKey))
+        End If
+
+        Dim baseVal2 As Double
+        baseVal2 = CDbl(sums(key))
+
+        Dim absPerfect As Double
+        absPerfect = baseVal2 * perfPct
+
+        Dim absAdd As Double
+        absAdd = (baseVal2 + absPerfect) * addPct
+
+        Dim absTotal As Double
+        absTotal = -(closeAbs + absPerfect + absAdd)
+
+        outArr(i, cScenario) = parts(0)
+        outArr(i, cOPF) = opfKey
+        outArr(i, cBrand) = brandKey
+        outArr(i, cPer) = periodKey
+        outArr(i, cAbs) = absTotal
+    Next key
+
+    lo.HeaderRowRange.Offset(1, 0).Resize(UBound(outArr, 1), lo.ListColumns.Count).Value = outArr
+    lo.ListColumns(cAbs).DataBodyRange.NumberFormat = "#,##0"
+End Sub
+
+'================================================================================
+' Buffer append: Buffer_Abs_Export appended per scenario actually combined
 ' Mapping:
 '   OPF/OPF_Bucket -> OPF Code (via dictMap)
 '   Brand          -> brand and brand2
@@ -245,7 +414,8 @@ Private Sub AppendBufferAbsExportPerScenario(ByVal wb As Workbook, ByVal wsCombi
     Dim arr As Variant
     arr = lo.DataBodyRange.Value2
 
-    Dim cOPF As Long, cBrand As Long, cPer As Long, cAbs As Long
+    Dim cScenario As Long, cOPF As Long, cBrand As Long, cPer As Long, cAbs As Long
+    cScenario = GetLoColIndexAny(lo, Array("Scenario"))
     cOPF = GetLoColIndexAny(lo, Array("OPF", "OPF_Bucket"))
     cBrand = GetLoColIndexAny(lo, Array("Brand"))
     cPer = GetLoColIndexAny(lo, Array("Period", "Foundry_Period", "FOUNDRY_PERIOD"))
@@ -264,12 +434,25 @@ Private Sub AppendBufferAbsExportPerScenario(ByVal wb As Workbook, ByVal wsCombi
         Dim startRow As Long
         startRow = wsCombined.Cells(wsCombined.Rows.Count, colScenario).End(xlUp).Row + 1
 
-        ' Build a block (bufRows x lastCol) so we write once
-        Dim outBlock() As Variant
-        ReDim outBlock(1 To bufRows, 1 To lastCol)
-
+        Dim matched As Long
+        matched = 0
         Dim r As Long
         For r = 1 To bufRows
+            If StrComp(CStr(arr(r, cScenario)), CStr(scen), vbTextCompare) = 0 Then
+                matched = matched + 1
+            End If
+        Next r
+        If matched = 0 Then GoTo NextScenario
+
+        ' Build a block (matched x lastCol) so we write once
+        Dim outBlock() As Variant
+        ReDim outBlock(1 To matched, 1 To lastCol)
+
+        Dim outRow As Long
+        outRow = 0
+
+        For r = 1 To bufRows
+            If StrComp(CStr(arr(r, cScenario)), CStr(scen), vbTextCompare) <> 0 Then GoTo NextBufRow
 
             Dim opfRaw As String
             opfRaw = Trim$(CStr(arr(r, cOPF)))
@@ -293,20 +476,22 @@ Private Sub AppendBufferAbsExportPerScenario(ByVal wb As Workbook, ByVal wsCombi
             Dim absT As Double
             absT = CDbl(NzNum(arr(r, cAbs)))
 
-            outBlock(r, colScenario) = CStr(scen)
-            outBlock(r, colOpfCode) = opfCodeVal
-            outBlock(r, colBrand) = br
-            outBlock(r, colBrand2) = br
-            outBlock(r, colYear) = per
+            outRow = outRow + 1
+            outBlock(outRow, colScenario) = CStr(scen)
+            outBlock(outRow, colOpfCode) = opfCodeVal
+            outBlock(outRow, colBrand) = br
+            outBlock(outRow, colBrand2) = br
+            outBlock(outRow, colYear) = per
             If br = "FL" Then
-                outBlock(r, colTwL2) = absT   ' exception: FL buffer rows go to port_tw@l2
+                outBlock(outRow, colTwL2) = absT   ' exception: FL buffer rows go to port_tw@l2
             Else
-                outBlock(r, colTwF2) = absT   ' default: everyone else goes to port_tw@f2
+                outBlock(outRow, colTwF2) = absT   ' default: everyone else goes to port_tw@f2
             End If
-
+NextBufRow:
         Next r
 
-        wsCombined.Range(wsCombined.Cells(startRow, 1), wsCombined.Cells(startRow + bufRows - 1, lastCol)).Value2 = outBlock
+        wsCombined.Range(wsCombined.Cells(startRow, 1), wsCombined.Cells(startRow + matched - 1, lastCol)).Value2 = outBlock
+NextScenario:
     Next scen
 End Sub
 
@@ -371,8 +556,112 @@ Private Function LoadFLFinesAllocation(ByVal wb As Workbook) As Object
 End Function
 
 '================================================================================
+' Buffers lookups
+'================================================================================
+Private Function LoadClosingBuffers(ByVal wb As Workbook) As Object
+    Const SH As String = "Buffers & OPF Physical Caps"
+    Const TBL As String = "Closing_Feedable_Stocks_Buffer"
+
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbTextCompare
+
+    Dim ws As Worksheet, lo As ListObject
+    On Error Resume Next
+    Set ws = wb.Worksheets(SH)
+    If Not ws Is Nothing Then Set lo = ws.ListObjects(TBL)
+    On Error GoTo 0
+
+    If lo Is Nothing Or lo.DataBodyRange Is Nothing Then
+        Set LoadClosingBuffers = dict
+        Exit Function
+    End If
+
+    Dim arr As Variant
+    arr = lo.DataBodyRange.Value2
+
+    Dim cProd As Long, cBuf As Long
+    cProd = GetLoColIndexAny(lo, Array("Product"))
+    cBuf = GetLoColIndexAny(lo, Array("Period 1 Closing Feedable Stocks Buffer"))
+
+    Dim r As Long
+    For r = 1 To UBound(arr, 1)
+        Dim prod As String
+        prod = UCase$(Trim$(CStr(arr(r, cProd))))
+        If prod <> "" Then dict(prod) = NzNum(arr(r, cBuf))
+    Next r
+
+    Set LoadClosingBuffers = dict
+End Function
+
+Private Function LoadAdditionalOpfBuffer(ByVal wb As Workbook) As Object
+    Const SH As String = "Buffers & OPF Physical Caps"
+    Const TBL As String = "Additional_OPF_Buffer"
+
+    Dim dict As Object: Set dict = CreateObject("Scripting.Dictionary")
+    dict.CompareMode = vbTextCompare
+
+    Dim ws As Worksheet, lo As ListObject
+    On Error Resume Next
+    Set ws = wb.Worksheets(SH)
+    If Not ws Is Nothing Then Set lo = ws.ListObjects(TBL)
+    On Error GoTo 0
+
+    If lo Is Nothing Or lo.DataBodyRange Is Nothing Then
+        Set LoadAdditionalOpfBuffer = dict
+        Exit Function
+    End If
+
+    Dim arr As Variant
+    arr = lo.DataBodyRange.Value2
+
+    Dim cOpf As Long, cBuf As Long
+    cOpf = GetLoColIndexAny(lo, Array("OPF"))
+    cBuf = GetLoColIndexAny(lo, Array("Additional OPF Buffer"))
+
+    Dim r As Long
+    For r = 1 To UBound(arr, 1)
+        Dim opf As String
+        opf = UCase$(Trim$(CStr(arr(r, cOpf))))
+        If opf <> "" Then dict(opf) = NzNum(arr(r, cBuf))
+    Next r
+
+    Set LoadAdditionalOpfBuffer = dict
+End Function
+
+Private Function LoadPerfectSolveBuffer(ByVal wb As Workbook) As Double
+    Const SH As String = "Buffers & OPF Physical Caps"
+    Const TBL As String = "Perfect_Solve_Buffer"
+
+    Dim ws As Worksheet, lo As ListObject
+    On Error Resume Next
+    Set ws = wb.Worksheets(SH)
+    If Not ws Is Nothing Then Set lo = ws.ListObjects(TBL)
+    On Error GoTo 0
+
+    If lo Is Nothing Or lo.DataBodyRange Is Nothing Then Exit Function
+
+    LoadPerfectSolveBuffer = NzNum(lo.DataBodyRange.Cells(1, 1).Value2)
+End Function
+
+'================================================================================
 ' Utilities
 '================================================================================
+Private Sub EnsureTableColumn(ByVal lo As ListObject, ByVal headerText As String)
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(Trim$(lo.ListColumns(i).Name), headerText, vbTextCompare) = 0 Then Exit Sub
+    Next i
+
+    lo.ListColumns.Add
+    lo.ListColumns(lo.ListColumns.Count).Name = headerText
+End Sub
+
+Private Function NormalizePct(ByVal v As Variant) As Double
+    Dim pct As Double
+    pct = NzNum(v)
+    If pct > 1# Then pct = pct / 100#
+    NormalizePct = pct
+End Function
 
 ' Values-only "last header col" (fixes phantom / formatting / table expansion issues)
 Private Function LastHeaderColByValues(ByVal ws As Worksheet, ByVal headerRow As Long) As Long
@@ -440,5 +729,3 @@ Private Function NzNum(ByVal v As Variant) As Double
         NzNum = 0#
     End If
 End Function
-
-

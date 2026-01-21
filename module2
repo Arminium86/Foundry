@@ -112,9 +112,6 @@ Public Sub PopulateFoundryConstraints()
         End If
     Next r
 
-DumpAbsBuffersToTable ThisWorkbook, ctx
-
-
 CleanExit:
     Application.ScreenUpdating = True
     Application.Calculation = xlCalculationAutomatic
@@ -1151,4 +1148,3 @@ Private Sub LogMsg(ByVal wb As Workbook, ByVal constraintName As String, ByVal m
     ws.Cells(r, 2).Value = constraintName
     ws.Cells(r, 3).Value = msg
 End Sub
-

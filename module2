@@ -1,0 +1,1154 @@
+Option Explicit
+
+Private gSuppressAbsBuffer As Boolean
+
+'========================
+' CONTEXT (cached lookups)
+'========================
+Private Type PopulateContext
+    tagSpec As Object          'key: product|limitrange|element -> value
+    torValue As Object         'key: productType|period -> value (tonnes)
+    torGrade As Object         'key: productType|period|element -> grade
+    prod2yp As Object          'key: productType|period -> tonnes
+    closingBuf As Object       'key: productType -> period1 buffer
+    additionalOpfBuf As Object 'key: opfCode -> additional buffer
+    opfCaps As Object          'key: opfCode -> capacity
+    perfectSolveBuf As Double
+    tmm As Object              'key: siteKey|period -> value
+    additionalMaxTonnes As Double   'global extra tonnes added to all MAX constraints in OPF tonnes family
+    absBuf As Object   ' key: opf|brand|period -> absolute tonnes buffer (total of all buffers)
+
+End Type
+
+'========================
+' CONFIG (edit here only)
+'========================
+Private Const TARGET_SHEET As String = "Foundry Constraints Table"
+Private Const TARGET_COL_CONSTRAINT As Long = 1          'A
+Private Const TARGET_COL_FIRST_PERIOD As Long = 10       'J
+Private Const N_PERIODS As Long = 8
+
+'Source sheet/table names
+Private Const SHEET_TOR As String = "TOR OPF Targets"
+Private Const TBL_TOR As String = "TOR_OPF_Targets"
+
+Private Const SHEET_2YP As String = "2YP OPF Production"
+Private Const TBL_2YP As String = "OPF_Production_2YP"
+
+Private Const SHEET_TAG As String = "TAG Shipping Specs"
+Private Const TBL_TAG As String = "TAG_Shipping_Specs"
+
+Private Const SHEET_BUFFERS As String = "Buffers & OPF Physical Caps"
+Private Const TBL_CLOSING_BUF As String = "Closing_Feedable_Stocks_Buffer"
+Private Const TBL_PERFECT_BUF As String = "Perfect_Solve_Buffer"
+Private Const TBL_ADDITIONAL_BUF As String = "Additional_OPF_Buffer"
+Private Const TBL_OPF_CAPS As String = "OPF_Physical_Capacities"
+
+Private Const SHEET_TMM As String = "TMM from Inventory"
+Private Const PIVOT_TMM As String = "TMM_from_Inventory"
+Private Const TBL_ADD_TONNES_MAX As String = "Additional_Tonnes_For_Max_Constraints"
+
+
+'Log sheet
+Private Const LOG_SHEET As String = "VBA_Populate_Log"
+
+'Interpretation of TAG LimitRange for "LQL" constraints
+'Adjust if your TAG table uses different labels.
+Private Const TAG_LIMIT_TARGET As String = "Target"
+Private Const TAG_LIMIT_LQL As String = "Low"
+
+'Perfect solve buffer is expressed as 0.05 for +5%
+'Additional OPF buffer and closing buffer are in TONNES (same UOM as tonnes)
+'========================
+
+
+'========================
+' PUBLIC ENTRYPOINT
+'========================
+Public Sub PopulateFoundryConstraints()
+    Dim wb As Workbook: Set wb = ThisWorkbook
+
+    Dim wsTgt As Worksheet
+    On Error Resume Next
+    Set wsTgt = wb.Worksheets(TARGET_SHEET)
+    On Error GoTo 0
+    If wsTgt Is Nothing Then
+        MsgBox "Target sheet not found: " & TARGET_SHEET, vbCritical
+        Exit Sub
+    End If
+
+    Application.ScreenUpdating = False
+    Application.Calculation = xlCalculationManual
+    Application.EnableEvents = False
+
+    Dim ctx As PopulateContext
+    ctx = BuildContext(wb)
+
+    Dim lastRow As Long
+    lastRow = wsTgt.Cells(wsTgt.Rows.Count, TARGET_COL_CONSTRAINT).End(xlUp).Row
+
+    Dim r As Long
+    For r = 1 To lastRow
+        Dim cname As String
+        cname = Trim$(CStr(wsTgt.Cells(r, TARGET_COL_CONSTRAINT).Value2))
+    
+        If Len(cname) > 0 Then
+            'Only touch rows explicitly flagged TRUE in column S
+            Dim doPopulate As Boolean
+            doPopulate = (UCase$(Trim$(CStr(wsTgt.Cells(r, 19).Value2))) = "TRUE") Or (wsTgt.Cells(r, 19).Value2 = True)
+    
+            If doPopulate Then
+                Dim vals(1 To N_PERIODS) As Variant
+                Dim ok As Boolean
+                ok = ResolveConstraintValues(cname, ctx, vals)
+    
+                Dim p As Long
+                For p = 1 To N_PERIODS
+                    wsTgt.Cells(r, TARGET_COL_FIRST_PERIOD + (p - 1)).Value = vals(p)
+                Next p
+    
+                If Not ok Then LogMsg wb, cname, "Unresolved or partially resolved (see blanks)."
+            End If
+        End If
+    Next r
+
+DumpAbsBuffersToTable ThisWorkbook, ctx
+
+
+CleanExit:
+    Application.ScreenUpdating = True
+    Application.Calculation = xlCalculationAutomatic
+    Application.EnableEvents = True
+End Sub
+
+Public Sub DumpAbsBuffersToTable(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    Const SH As String = "Buffers & OPF Physical Caps"
+    Const TBL As String = "Buffer_Abs_Export"
+
+    Dim ws As Worksheet
+    Set ws = wb.Worksheets(SH)
+
+    Dim lo As ListObject
+    On Error Resume Next
+    Set lo = ws.ListObjects(TBL)
+    On Error GoTo 0
+
+    'Create table if missing
+    If lo Is Nothing Then
+        Dim startCell As Range
+        Set startCell = ws.Range("A1")
+
+        startCell.Resize(1, 4).Value = Array("OPF_Bucket", "Brand", "Foundry_Period", "AbsBufferTonnes")
+
+        Set lo = ws.ListObjects.Add(xlSrcRange, startCell.Resize(2, 4), , xlYes)
+        lo.Name = TBL
+    Else
+        'Clear existing data (keep headers)
+        If Not lo.DataBodyRange Is Nothing Then lo.DataBodyRange.Delete
+    End If
+
+    'Write ctx.absBuf rows
+    If ctx.absBuf Is Nothing Then Exit Sub
+    If ctx.absBuf.Count = 0 Then Exit Sub
+
+    Dim outArr() As Variant
+    ReDim outArr(1 To ctx.absBuf.Count, 1 To 4)
+
+    Dim k As Variant, i As Long
+    i = 0
+    For Each k In ctx.absBuf.Keys
+        i = i + 1
+
+        Dim parts() As String
+        parts = Split(CStr(k), "|") 'OPF|BRAND|PERIOD
+
+        outArr(i, 1) = parts(0)
+        outArr(i, 2) = parts(1)
+        outArr(i, 3) = CLng(parts(2))
+        outArr(i, 4) = CDbl(ctx.absBuf(k))
+    Next k
+
+    lo.HeaderRowRange.Offset(1, 0).Resize(UBound(outArr, 1), 4).Value = outArr
+
+    'Optional formatting
+    lo.ListColumns("AbsBufferTonnes").DataBodyRange.NumberFormat = "#,##0"
+End Sub
+
+
+
+Private Function BuildContext(ByVal wb As Workbook) As PopulateContext
+    Dim ctx As PopulateContext
+    Set ctx.tagSpec = CreateObject("Scripting.Dictionary")
+    Set ctx.torValue = CreateObject("Scripting.Dictionary")
+    Set ctx.torGrade = CreateObject("Scripting.Dictionary")
+    Set ctx.prod2yp = CreateObject("Scripting.Dictionary")
+    Set ctx.closingBuf = CreateObject("Scripting.Dictionary")
+    Set ctx.additionalOpfBuf = CreateObject("Scripting.Dictionary")
+    Set ctx.opfCaps = CreateObject("Scripting.Dictionary")
+    Set ctx.tmm = CreateObject("Scripting.Dictionary")
+    Set ctx.absBuf = CreateObject("Scripting.Dictionary")
+    ctx.perfectSolveBuf = 0#
+    ctx.additionalMaxTonnes = 0#
+
+    LoadTagSpecs wb, ctx
+    LoadTorTargets wb, ctx
+    Load2YPProduction wb, ctx
+    LoadBuffersAndCaps wb, ctx
+    LoadTMMFromPivot wb, ctx
+
+    BuildContext = ctx
+End Function
+
+
+'========================
+' LOADERS
+'========================
+Private Sub LoadTagSpecs(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    Dim lo As ListObject
+    Set lo = GetTable(wb, TBL_TAG)
+    If lo Is Nothing Then
+        LogMsg wb, "(startup)", "Missing table: " & TBL_TAG
+        Exit Sub
+    End If
+
+    Dim arr, r As Long
+    arr = lo.DataBodyRange.Value2
+
+    Dim cProduct As Long, cLimit As Long
+    Dim cFe As Long, cSi As Long, cAl As Long, cMn As Long, cP As Long
+    cProduct = ColIndex(lo, "Product")
+    cLimit = ColIndex(lo, "LimitRange")
+    cFe = ColIndex(lo, "Fe")
+    cSi = ColIndex(lo, "SiO2")
+    cAl = ColIndex(lo, "Al2O3")
+    cMn = ColIndex(lo, "Mn")
+    cP = ColIndex(lo, "P")
+
+    For r = 1 To UBound(arr, 1)
+        Dim prod As String, lim As String
+        prod = UCase$(Trim$(CStr(arr(r, cProduct))))
+        lim = Trim$(CStr(arr(r, cLimit)))
+
+        If Len(prod) > 0 And Len(lim) > 0 Then
+            ctx.tagSpec(prod & "|" & lim & "|FE") = NzNum(arr(r, cFe))
+            ctx.tagSpec(prod & "|" & lim & "|SI") = NzNum(arr(r, cSi))
+            ctx.tagSpec(prod & "|" & lim & "|AL") = NzNum(arr(r, cAl))
+            ctx.tagSpec(prod & "|" & lim & "|MN") = NzNum(arr(r, cMn))
+            ctx.tagSpec(prod & "|" & lim & "|P") = NzNum(arr(r, cP))
+        End If
+    Next r
+End Sub
+
+Private Sub LoadAdditionalTonnesForMax(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    Dim lo As ListObject
+    Set lo = GetTable(wb, TBL_ADD_TONNES_MAX)
+    If lo Is Nothing Then
+        LogMsg wb, "(startup)", "Missing table (optional): " & TBL_ADD_TONNES_MAX
+        Exit Sub
+    End If
+
+    'Assumption: table has ONE data cell containing the value (like Perfect_Solve_Buffer)
+    'We take first cell of the DataBodyRange.
+    ctx.additionalMaxTonnes = NzNum(lo.DataBodyRange.Cells(1, 1).Value2)
+End Sub
+
+Private Sub LoadTorTargets(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    Dim lo As ListObject
+    Set lo = GetTable(wb, TBL_TOR)
+    If lo Is Nothing Then
+        LogMsg wb, "(startup)", "Missing table: " & TBL_TOR
+        Exit Sub
+    End If
+
+    Dim arr, r As Long
+    arr = lo.DataBodyRange.Value2
+
+    Dim cProd As Long, cPeriod As Long, cValue As Long
+    Dim cFe As Long, cSi As Long, cAl As Long, cMn As Long, cP As Long
+    cProd = ColIndex(lo, "PRODUCT_TYPE")
+    cPeriod = ColIndex(lo, "FOUNDRY_PERIOD")
+    cValue = ColIndex(lo, "VALUE")
+    cFe = ColIndex(lo, "FE")
+    cSi = ColIndex(lo, "SI")
+    cAl = ColIndex(lo, "AL")
+    cMn = ColIndex(lo, "MN")
+    cP = ColIndex(lo, "P")
+
+    For r = 1 To UBound(arr, 1)
+        Dim pt As String: pt = UCase$(Trim$(CStr(arr(r, cProd))))
+        Dim per As Long: per = CLng(NzNum(arr(r, cPeriod)))
+
+        If Len(pt) > 0 And per >= 1 And per <= N_PERIODS Then
+            Dim kVal As String: kVal = pt & "|" & CStr(per)
+            ctx.torValue(kVal) = NzNum(arr(r, cValue))
+
+            ctx.torGrade(pt & "|" & CStr(per) & "|FE") = NzNum(arr(r, cFe))
+            ctx.torGrade(pt & "|" & CStr(per) & "|SI") = NzNum(arr(r, cSi))
+            ctx.torGrade(pt & "|" & CStr(per) & "|AL") = NzNum(arr(r, cAl))
+            ctx.torGrade(pt & "|" & CStr(per) & "|MN") = NzNum(arr(r, cMn))
+            ctx.torGrade(pt & "|" & CStr(per) & "|P") = NzNum(arr(r, cP))
+        End If
+    Next r
+End Sub
+
+Private Sub Load2YPProduction(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    Dim lo As ListObject
+    Set lo = GetTable(wb, TBL_2YP)
+    If lo Is Nothing Then
+        LogMsg wb, "(startup)", "Missing table: " & TBL_2YP
+        Exit Sub
+    End If
+
+    Dim arr, r As Long
+    arr = lo.DataBodyRange.Value2
+
+    Dim cProd As Long, cPeriod As Long, cTonnes As Long
+    cProd = ColIndex(lo, "PRODUCT_TYPE")
+    cPeriod = ColIndex(lo, "FOUNDRY_PERIOD")
+    cTonnes = ColIndex(lo, "TONNES")
+
+    For r = 1 To UBound(arr, 1)
+        Dim pt As String: pt = UCase$(Trim$(CStr(arr(r, cProd))))
+        Dim per As Long: per = CLng(NzNum(arr(r, cPeriod)))
+    
+        If Len(pt) > 0 And per >= 1 And per <= N_PERIODS Then
+            Dim k As String
+            k = pt & "|" & CStr(per)
+    
+            If ctx.prod2yp.Exists(k) Then
+                ctx.prod2yp(k) = CDbl(ctx.prod2yp(k)) + NzNum(arr(r, cTonnes))
+            Else
+                ctx.prod2yp(k) = NzNum(arr(r, cTonnes))
+            End If
+        End If
+    Next r
+
+End Sub
+
+Private Sub LoadBuffersAndCaps(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    'Closing feedable stocks buffer (period 1 only)
+    Dim loClose As ListObject
+    Set loClose = GetTable(wb, TBL_CLOSING_BUF)
+    If Not loClose Is Nothing Then
+        Dim arr, r As Long
+        arr = loClose.DataBodyRange.Value2
+        Dim cProd As Long, cBuf As Long
+        cProd = ColIndex(loClose, "Product")
+        cBuf = ColIndex(loClose, "Period 1 Closing Feedable Stocks Buffer")
+        For r = 1 To UBound(arr, 1)
+            Dim pt As String: pt = UCase$(Trim$(CStr(arr(r, cProd))))
+            If Len(pt) > 0 Then ctx.closingBuf(pt) = NzNum(arr(r, cBuf))
+        Next r
+    Else
+        LogMsg wb, "(startup)", "Missing table: " & TBL_CLOSING_BUF
+    End If
+
+    'Perfect solve buffer (single value)
+    Dim loPerf As ListObject
+    Set loPerf = GetTable(wb, TBL_PERFECT_BUF)
+    If Not loPerf Is Nothing Then
+        'Assume single cell value in first column of first data row
+        ctx.perfectSolveBuf = NzNum(loPerf.DataBodyRange.Cells(1, 1).Value2)
+    Else
+        LogMsg wb, "(startup)", "Missing table: " & TBL_PERFECT_BUF
+    End If
+
+    'Additional OPF buffer
+    Dim loAdd As ListObject
+    Set loAdd = GetTable(wb, TBL_ADDITIONAL_BUF)
+    If Not loAdd Is Nothing Then
+        Dim arrA, i As Long
+        arrA = loAdd.DataBodyRange.Value2
+        Dim cOPF As Long, cAbuf As Long
+        cOPF = ColIndex(loAdd, "OPF")
+        cAbuf = ColIndex(loAdd, "Additional OPF Buffer")
+        For i = 1 To UBound(arrA, 1)
+            Dim opf As String: opf = UCase$(Trim$(CStr(arrA(i, cOPF))))
+            If Len(opf) > 0 Then ctx.additionalOpfBuf(opf) = NzNum(arrA(i, cAbuf))
+        Next i
+    Else
+        LogMsg wb, "(startup)", "Missing table: " & TBL_ADDITIONAL_BUF
+    End If
+
+    'OPF physical capacities
+    Dim loCap As ListObject
+    Set loCap = GetTable(wb, TBL_OPF_CAPS)
+    If Not loCap Is Nothing Then
+        Dim arrC, j As Long
+        arrC = loCap.DataBodyRange.Value2
+        Dim cOpf2 As Long, cCap As Long
+        cOpf2 = ColIndex(loCap, "OPF")
+        cCap = ColIndex(loCap, "OPF Physical Capacities")
+        For j = 1 To UBound(arrC, 1)
+            Dim opf2 As String: opf2 = UCase$(Trim$(CStr(arrC(j, cOpf2))))
+            If Len(opf2) > 0 Then ctx.opfCaps(opf2) = NzNum(arrC(j, cCap))
+        Next j
+    Else
+        LogMsg wb, "(startup)", "Missing table: " & TBL_OPF_CAPS
+    End If
+    LoadAdditionalTonnesForMax wb, ctx
+End Sub
+
+Private Sub LoadTMMFromPivot(ByVal wb As Workbook, ByRef ctx As PopulateContext)
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets(SHEET_TMM)
+    On Error GoTo 0
+    If ws Is Nothing Then
+        LogMsg wb, "(startup)", "Missing sheet: " & SHEET_TMM
+        Exit Sub
+    End If
+
+    Dim pt As PivotTable
+    On Error Resume Next
+    Set pt = ws.PivotTables(PIVOT_TMM)
+    On Error GoTo 0
+    If pt Is Nothing Then
+        LogMsg wb, "(startup)", "Missing pivot: " & PIVOT_TMM
+        Exit Sub
+    End If
+
+    Dim rng As Range
+    Set rng = pt.TableRange1
+
+    'Assumptions you described:
+    ' - Period headers are in row 4, columns B:I (but we’ll read dynamically from pivot range)
+    ' - Site keys (row labels) are in first column of pivot range (excluding header)
+    Dim r As Long, c As Long
+    Dim cKey As Variant
+    Dim nRows As Long, nCols As Long
+    nRows = rng.Rows.Count
+    nCols = rng.Columns.Count
+
+    'Find header row that contains 1..8
+    Dim headerRow As Long: headerRow = 0
+    For r = 1 To nRows
+        Dim hits As Long: hits = 0
+        For c = 1 To nCols
+            If IsNumeric(rng.Cells(r, c).Value2) Then
+                Dim v As Double: v = CDbl(rng.Cells(r, c).Value2)
+                If v >= 1 And v <= N_PERIODS Then hits = hits + 1
+            End If
+        Next c
+        If hits >= 6 Then 'heuristic: most period headers in one row
+            headerRow = r
+            Exit For
+        End If
+    Next r
+
+    If headerRow = 0 Then
+        LogMsg wb, "(startup)", "Could not locate period header row in pivot " & PIVOT_TMM
+        Exit Sub
+    End If
+
+    'Map column index -> period number
+    Dim colToPer As Object: Set colToPer = CreateObject("Scripting.Dictionary")
+    For c = 1 To nCols
+        If IsNumeric(rng.Cells(headerRow, c).Value2) Then
+            Dim per As Long: per = CLng(rng.Cells(headerRow, c).Value2)
+            If per >= 1 And per <= N_PERIODS Then colToPer(c) = per
+        End If
+    Next c
+
+    'Data rows start below headerRow; first column contains site key
+    For r = headerRow + 1 To nRows
+        Dim siteKey As String
+        siteKey = LCase$(Trim$(CStr(rng.Cells(r, 1).Value2)))
+        If Len(siteKey) > 0 And siteKey <> "row labels" Then
+            For Each cKey In colToPer.Keys
+                Dim p As Long: p = CLng(colToPer(cKey))
+                ctx.tmm(siteKey & "|" & CStr(p)) = NzNum(rng.Cells(r, CLng(cKey)).Value2)
+            Next cKey
+        End If
+    Next r
+End Sub
+
+
+'========================
+' MAIN RESOLVER (dispatcher)
+'========================
+Private Function ResolveConstraintValues(ByVal cname As String, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    Dim ok As Boolean: ok = True
+    Dim i As Long
+    For i = 1 To N_PERIODS: outVals(i) = vbNullString: Next i
+
+    Dim s As String: s = LCase$(Trim$(cname))
+
+    '0) Grand total OPF capacity MUST be handled early (no OPF prefix to parse)
+    If s = "opf_total_tw_max" Then
+        ResolveConstraintValues = FillTotalOpfCapacityFromOpfMins(ThisWorkbook.Worksheets(TARGET_SHEET), ctx, outVals)
+        Exit Function
+    End If
+
+    'A) Port grades by brand (from TAG Shipping Specs)
+    If Left$(s, 5) = "port_" Then
+        ResolveConstraintValues = FillPortGradeFromTAG(cname, ctx, outVals)
+        Exit Function
+    End If
+
+    'B) Grades by OPF (ONLY FE/SI/AL/MN/P constraints)
+    '   This prevents any *_total_tw_* (including CB @f/@l naming) from ever routing here.
+    If InStr(1, s, "opf_total_", vbTextCompare) > 0 Then
+        If (InStr(1, s, "total_fe", vbTextCompare) > 0) _
+        Or (InStr(1, s, "total_si", vbTextCompare) > 0) _
+        Or (InStr(1, s, "total_al", vbTextCompare) > 0) _
+        Or (InStr(1, s, "total_mn", vbTextCompare) > 0) _
+        Or (InStr(1, s, "total_p", vbTextCompare) > 0) Then
+
+            ResolveConstraintValues = FillOpfGradeFromTOR(cname, ctx, outVals)
+            Exit Function
+        End If
+    End If
+
+    'C) Anything with total_tw is tonnes-family (including CB constraints that contain @f/@l)
+    If InStr(1, s, "_total_tw", vbTextCompare) > 0 Then
+
+        'C1) OPF Physical capacity constraints (no product code):
+        ' ccopf_total_tw_Max, cbopf_total_tw_Max, sol_ftopf_total_tw_Max, sol_vkwopf_total_tw_Max, ewopf_total_tw_Max
+        If Right$(s, 4) = "_max" Then
+            If ProductCodeFromConstraint(cname) = "" Then
+                ResolveConstraintValues = FillOpfPhysicalCapacity(cname, ctx, outVals)
+                Exit Function
+            End If
+        End If
+
+        'C2) Product tonnes at OPF constraints: ccopf_total_tw_FB_Max etc. (including CB @f/@l variants)
+        ResolveConstraintValues = FillOpfProductTonnes(cname, ctx, outVals)
+        Exit Function
+    End If
+
+    'D) TMM by site / movement (from pivot)
+    If InStr(1, s, "_mine_", vbTextCompare) > 0 Or Left$(s, 8) = "mine_wet" Then
+        ResolveConstraintValues = FillTMM(cname, ctx, outVals)
+        Exit Function
+    End If
+
+    'Otherwise: not handled
+    ResolveConstraintValues = False
+End Function
+
+
+
+'========================
+' HANDLERS
+'========================
+Private Function FillPortGradeFromTAG(ByVal cname As String, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    'Examples:
+    ' port_fe@f.port_t@f_FB, FL_Min
+    ' port_si@f_LQL.port_t@f_FB, FL_Max
+    ' We will extract:
+    '  - element: FE/SI/AL/MN/P
+    '  - product: FB/SS/WP/KF/FL/LG from last token like _FB or _SS or _FL etc.
+    '  - LQL flag: contains "_LQL"
+    Dim s As String: s = LCase$(cname)
+
+    Dim element As String: element = UCase$(ExtractBetween(s, "port_", "@"))
+    If element = "" Then element = UCase$(ExtractBetween(s, "port_", ".")) 'fallback
+
+    element = CanonElement(element)
+    If element = "" Then
+        LogMsg ThisWorkbook, cname, "Port TAG: could not parse element."
+        FillPortGradeFromTAG = False
+        Exit Function
+    End If
+
+    Dim prod As String: prod = ProductCodeFromConstraint(cname)
+    If prod = "" Then
+        LogMsg ThisWorkbook, cname, "Port TAG: could not parse product code."
+        FillPortGradeFromTAG = False
+        Exit Function
+    End If
+
+    Dim limitRange As String
+    If InStr(1, s, "_lql", vbTextCompare) > 0 Then
+        limitRange = TAG_LIMIT_LQL
+    Else
+        limitRange = TAG_LIMIT_TARGET
+    End If
+
+    Dim k As String: k = UCase$(prod) & "|" & limitRange & "|" & element
+    If Not ctx.tagSpec.Exists(k) Then
+        LogMsg ThisWorkbook, cname, "Port TAG: missing TAG key " & k
+        FillPortGradeFromTAG = False
+        Exit Function
+    End If
+
+    Dim v As Double: v = CDbl(ctx.tagSpec(k))
+    Dim p As Long
+    For p = 1 To N_PERIODS
+        outVals(p) = v 'not period-based
+    Next p
+
+    FillPortGradeFromTAG = True
+End Function
+
+Private Function FillOpfGradeFromTOR(ByVal cname As String, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    'Examples:
+    ' ccopf_total_fe@f.ccopf_total_t_FB_Min
+    ' cbopf_total_si@l.cbopf_total_t@l_FL_Max
+    ' ewopf_total_p@f.ewopf_total_t_SS_Max
+    ' We extract:
+    ' - OPF code from prefix (ccopf/cbopf/ewopf/sol_ftopf/sol_vkwopf)
+    ' - product code from "_t_" segment (FB/SS/LG/FL/KF/WP)
+    ' - element from "total_<el>"
+    Dim s As String: s = LCase$(cname)
+
+    Dim opf As String: opf = OpfCodeFromConstraint(cname)
+    If opf = "" Then
+        LogMsg ThisWorkbook, cname, "OPF grade: could not parse OPF code."
+        FillOpfGradeFromTOR = False
+        Exit Function
+    End If
+
+    Dim prod As String: prod = ProductCodeFromConstraint(cname)
+    If prod = "" Then
+        LogMsg ThisWorkbook, cname, "OPF grade: could not parse product code."
+        FillOpfGradeFromTOR = False
+        Exit Function
+    End If
+
+    Dim element As String
+    element = CanonElement(ExtractBetween(s, "total_", "@"))
+    If element = "" Then element = CanonElement(ExtractBetween(s, "total_", "."))
+    If element = "" Then
+        LogMsg ThisWorkbook, cname, "OPF grade: could not parse element."
+        FillOpfGradeFromTOR = False
+        Exit Function
+    End If
+
+    Dim productType As String
+    productType = UCase$(opf & prod) 'e.g. CC + FB -> CCFB ; CB + FL -> CBFL ; EW + WP -> EWWP etc.
+
+    Dim ok As Boolean: ok = True
+    Dim per As Long
+    For per = 1 To N_PERIODS
+        Dim k As String: k = productType & "|" & CStr(per) & "|" & element
+        If ctx.torGrade.Exists(k) Then
+            outVals(per) = CDbl(ctx.torGrade(k))
+        Else
+            outVals(per) = vbNullString
+            ok = False
+        End If
+    Next per
+
+    If Not ok Then LogMsg ThisWorkbook, cname, "OPF grade: missing TOR grades for " & productType & " (some periods)."
+    FillOpfGradeFromTOR = ok
+End Function
+
+Private Function FillOpfProductTonnes(ByVal cname As String, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    'Rule (per your clarification):
+    ' Period 1: 2YP OPF Production + Closing_Feedable_Stocks_Buffer (absolute tonnes)
+    ' All periods: apply Additional_OPF_Buffer % uplift
+    ' Periods 2..8: TOR OPF Targets + Perfect_Solve_Buffer % uplift + Additional_OPF_Buffer % uplift
+
+    Dim opf As String: opf = OpfCodeFromConstraint(cname)
+    Dim prod As String: prod = ProductCodeFromConstraint(cname)
+    Dim isMax As Boolean
+    isMax = (Right$(LCase$(cname), 4) = "_max")
+    Dim doAbs As Boolean
+    doAbs = Not isMax   'store abs buffers only once (on MIN constraints)
+    
+    If opf = "" Or prod = "" Then
+        LogMsg ThisWorkbook, cname, "OPF tonnes: could not parse OPF/product."
+        FillOpfProductTonnes = False
+        Exit Function
+    End If
+
+    'CB special case: if constraint mentions both FB and FL, ignore FL and treat as FB
+    If UCase$(opf) = "CB" Then
+        If InStr(1, UCase$(cname), "FB", vbTextCompare) > 0 Then prod = "FB"
+    End If
+
+    Dim productType As String: productType = UCase$(opf & prod)
+
+    'Closing buffer key exceptions:
+    Dim closeKey As String
+    closeKey = UCase$(productType)
+
+    If Left$(LCase$(cname), 10) = "sol_vkwopf" Then
+        closeKey = "KG" & UCase$(prod)
+    ElseIf Left$(LCase$(cname), 5) = "ewopf" Then
+        closeKey = "EL" & UCase$(prod)
+    End If
+
+    Dim closeAbs As Double: closeAbs = 0#
+    If ctx.closingBuf.Exists(closeKey) Then closeAbs = CDbl(ctx.closingBuf(closeKey))
+
+    'Percent buffers
+    Dim addPct As Double: addPct = 0#
+    If ctx.additionalOpfBuf.Exists(UCase$(opf)) Then addPct = NzNum(ctx.additionalOpfBuf(UCase$(opf)))
+    ' Normalise if user entered 5 instead of 0.05
+    If addPct > 1# Then addPct = addPct / 100#
+
+    Dim perfPct As Double: perfPct = ctx.perfectSolveBuf 'already a fraction e.g., 0.05
+
+    Dim ok As Boolean: ok = True
+
+    'Period 1 from 2YP (CB exception: CBFB & CBSS come from CBSF / 2)
+    Dim k2 As String
+    Dim base1 As Double
+    Dim baseNoClose As Double  ' base before adding closeAbs (and before %)
+
+    If UCase$(opf) = "CB" And (UCase$(prod) = "FB" Or UCase$(prod) = "SS") Then
+        'Use CBSF as the source for period 1, split half-half
+        k2 = "CBSF|1"
+        If ctx.prod2yp.Exists(k2) Then
+            baseNoClose = CDbl(ctx.prod2yp(k2)) / 2#     ' production only
+            base1 = baseNoClose
+
+            'Add closing buffer for the specific productType (CBFB or CBSS), if present
+            base1 = base1 + closeAbs
+            outVals(1) = base1 * (1# + addPct)
+
+            ' ABS buffer: closeAbs (absolute) + additional % applied to PRODUCTION only
+            Dim absAddP1 As Double: absAddP1 = base1 * addPct
+            If doAbs Then Call AddAbsBuffer(ctx, opf, prod, 1, closeAbs + absAddP1)
+        Else
+            outVals(1) = vbNullString
+            ok = False
+            LogMsg ThisWorkbook, cname, "OPF tonnes P1: missing 2YP for CBSF (CB FB/SS split)."
+        End If
+    Else
+        'Normal behavior: use the productType directly
+        k2 = UCase$(productType) & "|1"
+        If ctx.prod2yp.Exists(k2) Then
+            baseNoClose = CDbl(ctx.prod2yp(k2))          ' production only
+            base1 = baseNoClose + closeAbs
+            outVals(1) = base1 * (1# + addPct)
+
+            ' ABS buffer: closeAbs (absolute) + additional % applied to PRODUCTION only
+            Dim absAddP1b As Double: absAddP1b = base1 * addPct
+            If doAbs Then Call AddAbsBuffer(ctx, opf, prod, 1, closeAbs + absAddP1b)
+
+        Else
+            outVals(1) = vbNullString
+            ok = False
+            LogMsg ThisWorkbook, cname, "OPF tonnes P1: missing 2YP for " & productType
+        End If
+    End If
+
+    'Periods 2..8 from TOR
+    Dim per As Long
+    For per = 2 To N_PERIODS
+        Dim kTor As String: kTor = UCase$(productType) & "|" & CStr(per)
+        If ctx.torValue.Exists(kTor) Then
+            Dim baseTor As Double: baseTor = CDbl(ctx.torValue(kTor))
+            outVals(per) = baseTor * (1# + perfPct) * (1# + addPct)
+
+            ' store ABS buffer tonnes for periods 2+ (Perfect Solve % + Additional OPF %)
+            Dim absPerfect As Double
+            absPerfect = baseTor * perfPct
+
+            Dim baseAfterPerfect As Double
+            baseAfterPerfect = baseTor + absPerfect
+
+            Dim absAdd As Double
+            absAdd = baseAfterPerfect * addPct
+
+            If doAbs Then Call AddAbsBuffer(ctx, opf, prod, per, absPerfect + absAdd)
+
+            If isMax Then
+                If Abs(NzNum(outVals(per))) > 0.0000001 Then
+                    outVals(per) = NzNum(outVals(per)) + ctx.additionalMaxTonnes
+                End If
+            End If
+        Else
+            outVals(per) = vbNullString
+            ok = False
+        End If
+    Next per
+
+    If Not ok Then LogMsg ThisWorkbook, cname, "OPF tonnes: missing TOR values for " & productType & " (some periods)."
+    FillOpfProductTonnes = ok
+End Function
+
+
+Private Sub AddAbsBuffer(ByRef ctx As PopulateContext, ByVal opf As String, ByVal brand As String, ByVal period As Long, ByVal absTonnes As Double)
+    If gSuppressAbsBuffer Then
+        ' Optional debug: uncomment to trace suppressed additions
+        ' Debug.Print "Suppress AddAbsBuffer for " & UCase$(opf) & "|" & UCase$(brand) & "|" & period & " val=" & absTonnes
+        Exit Sub
+    End If
+
+    Dim k As String
+    k = UCase$(opf) & "|" & UCase$(brand) & "|" & CStr(period)
+
+    If ctx.absBuf.Exists(k) Then
+        ctx.absBuf(k) = CDbl(ctx.absBuf(k)) + absTonnes
+    Else
+        ctx.absBuf(k) = absTonnes
+    End If
+End Sub
+
+
+
+
+Private Function FillOpfPhysicalCapacity(ByVal cname As String, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    'Examples:
+    ' ccopf_total_tw_Max
+    ' cbopf_total_tw_Max
+    ' sol_ftopf_total_tw_Max
+    ' sol_vkwopf_total_tw_Max
+    ' ewopf_total_tw_Max
+
+    Dim opf As String: opf = OpfKeyForCapacity(cname)    'use capacity-specific mapping
+    If opf = "" Then
+        LogMsg ThisWorkbook, cname, "OPF capacity: could not parse OPF."
+        FillOpfPhysicalCapacity = False
+        Exit Function
+    End If
+
+    If Not ctx.opfCaps.Exists(UCase$(opf)) Then
+        LogMsg ThisWorkbook, cname, "OPF capacity: missing capacity for OPF=" & UCase$(opf)
+        FillOpfPhysicalCapacity = False
+        Exit Function
+    End If
+
+    ' base capacity (divide by 4 if required)
+    Dim baseCap As Double
+    baseCap = CDbl(ctx.opfCaps(UCase$(opf))) / 4#
+
+    'percent buffers
+    Dim addPct As Double: addPct = 0#
+    If ctx.additionalOpfBuf.Exists(UCase$(opf)) Then addPct = CDbl(ctx.additionalOpfBuf(UCase$(opf)))
+
+    Dim perfPct As Double: perfPct = ctx.perfectSolveBuf
+
+    'Period 1: closing inventory buffer summed across products for this OPF (special product-key rules handled inside)
+    Dim closeOPF As Double: closeOPF = ClosingInventoryByOPF(ctx, UCase$(opf), cname)
+
+    Dim p As Long
+    For p = 1 To N_PERIODS
+        If p = 1 Then
+            outVals(p) = (baseCap + closeOPF) * (1# + addPct)
+        Else
+            outVals(p) = baseCap * (1# + perfPct) * (1# + addPct)
+        End If
+
+        ' --- NEW RULE: if sum of mins for this OPF in this period is larger, use that instead ---
+        Dim sumMins As Double
+        sumMins = SumOpfMinsForPeriod(ctx, UCase$(opf), p)
+        If sumMins > NzNum(outVals(p)) Then outVals(p) = sumMins
+        ' ---------------------------------------------------------------------------------------
+    Next p
+
+    FillOpfPhysicalCapacity = True
+End Function
+
+
+
+Private Function FillTotalOpfCapacityFromOpfMins(ByVal wsTgt As Worksheet, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    Dim p As Long
+    For p = 1 To N_PERIODS: outVals(p) = 0#: Next p
+
+    Dim lastRow As Long
+    lastRow = wsTgt.Cells(wsTgt.Rows.Count, TARGET_COL_CONSTRAINT).End(xlUp).Row
+
+    Dim r As Long
+    For r = 1 To lastRow
+        Dim cname As String
+        cname = Trim$(CStr(wsTgt.Cells(r, TARGET_COL_CONSTRAINT).Value2))
+        If Len(cname) > 0 Then
+            Dim s As String: s = LCase$(cname)
+
+            'Include MIN constraints for individual OPFs (product tonnes at OPF family)
+            'We exclude the grand total itself to avoid recursion.
+            If s <> "opf_total_tw_max" Then
+                If Right$(s, 4) = "_min" And InStr(1, s, "opf_total_tw", vbTextCompare) > 0 Then
+                    'Compute this min constraint from sources
+                    Dim vals(1 To N_PERIODS) As Variant
+                    gSuppressAbsBuffer = True
+                    Call ResolveConstraintValues(cname, ctx, vals)
+                    gSuppressAbsBuffer = False
+                    
+                    For p = 1 To N_PERIODS
+                        outVals(p) = CDbl(outVals(p)) + NzNum(vals(p))
+                    Next p
+
+                End If
+            End If
+        End If
+    Next r
+
+    FillTotalOpfCapacityFromOpfMins = True
+End Function
+
+
+Private Function FillTMM(ByVal cname As String, ByRef ctx As PopulateContext, ByRef outVals() As Variant) As Boolean
+    'Examples:
+    ' cb_mine_t_Max / cb_mine_t_Min -> site key "cb"
+    ' cc_mine_t_Max ...
+    ' mine_wett_Max (special)
+    Dim s As String: s = LCase$(Trim$(cname))
+
+    Dim site As String
+    If Left$(s, 9) = "mine_wett" Then
+        site = "mine_wett"
+    Else
+        site = Split(s, "_")(0) 'cb, cc, ew, ff, ft, vk, vq...
+    End If
+
+    Dim ok As Boolean: ok = True
+    Dim per As Long
+    For per = 1 To N_PERIODS
+        Dim k As String: k = site & "|" & CStr(per)
+        If ctx.tmm.Exists(k) Then
+            outVals(per) = CDbl(ctx.tmm(k))
+        Else
+            outVals(per) = vbNullString
+            ok = False
+        End If
+    Next per
+
+    If Not ok Then LogMsg ThisWorkbook, cname, "TMM: missing pivot values for site=" & site & " (some periods)."
+    FillTMM = ok
+End Function
+
+
+
+
+Private Function SumOpfMinsForPeriod(ByRef ctx As PopulateContext, ByVal opfKey As String, ByVal period As Long) As Double
+    Dim ws As Worksheet
+    Set ws = ThisWorkbook.Worksheets(TARGET_SHEET)
+
+    Dim lastRow As Long
+    lastRow = ws.Cells(ws.Rows.Count, TARGET_COL_CONSTRAINT).End(xlUp).Row
+
+    Dim total As Double: total = 0#
+    Dim r As Long
+
+    For r = 1 To lastRow
+        Dim cname As String
+        cname = Trim$(CStr(ws.Cells(r, TARGET_COL_CONSTRAINT).Value2))
+        If Len(cname) = 0 Then GoTo NextRow
+
+        'Only include active constraints (Column S = TRUE), consistent with your populate gating
+        Dim active As Boolean
+        active = (UCase$(Trim$(CStr(ws.Cells(r, 19).Value2))) = "TRUE") Or (ws.Cells(r, 19).Value2 = True)
+        If Not active Then GoTo NextRow
+
+        Dim s As String: s = LCase$(cname)
+        If InStr(1, s, "_total_tw", vbTextCompare) = 0 Then GoTo NextRow
+        If Right$(s, 4) <> "_min" Then GoTo NextRow
+        If s = "opf_total_tw_max" Then GoTo NextRow
+
+        'CRITICAL: use the capacity OPF mapping so VK vs VKW doesn't break grouping
+        Dim thisOpf As String
+        thisOpf = UCase$(OpfKeyForCapacity(cname))
+        If thisOpf <> UCase$(opfKey) Then GoTo NextRow
+
+        Dim vals(1 To N_PERIODS) As Variant
+        gSuppressAbsBuffer = True
+        Call ResolveConstraintValues(cname, ctx, vals)
+        gSuppressAbsBuffer = False
+        total = total + NzNum(vals(period))
+
+NextRow:
+    Next r
+
+    SumOpfMinsForPeriod = total
+End Function
+
+
+
+
+Private Function ClosingInventoryByOPF(ByRef ctx As PopulateContext, ByVal capacityOpfKey As String, ByVal cname As String) As Double
+    Dim sumV As Double: sumV = 0#
+
+    'Default prefix match
+    Dim matchPrefix As String: matchPrefix = UCase$(capacityOpfKey)
+
+    'Exceptions for closing buffer product keys:
+    ' - sol_vkwopf_total_tw_* capacity uses VK, but closing products contain "KG"
+    ' - ewopf_total_tw_* capacity uses EW, but closing products contain "EL"
+    Dim s As String: s = LCase$(cname)
+    Dim useContains As Boolean: useContains = False
+    Dim containsTok As String: containsTok = ""
+
+    If Left$(s, 10) = "sol_vkwopf" Then
+        useContains = True
+        containsTok = "KG"
+    ElseIf Left$(s, 5) = "ewopf" Then
+        useContains = True
+        containsTok = "EL"
+    End If
+
+    Dim k As Variant, kk As String
+    For Each k In ctx.closingBuf.Keys
+        kk = UCase$(CStr(k)) 'e.g., "CBFB", "CCFB", maybe "KGFB", "ELSS", etc.
+
+        If useContains Then
+            If InStr(1, kk, containsTok, vbTextCompare) > 0 Then
+                sumV = sumV + CDbl(ctx.closingBuf(k))
+            End If
+        Else
+            If Left$(kk, Len(matchPrefix)) = matchPrefix Then
+                sumV = sumV + CDbl(ctx.closingBuf(k))
+            End If
+        End If
+    Next k
+
+    ClosingInventoryByOPF = sumV
+End Function
+
+
+Private Function OpfKeyForCapacity(ByVal cname As String) As String
+    Dim s As String: s = LCase$(Trim$(cname))
+
+    'Special cases for capacity lookup table
+    If Left$(s, 10) = "sol_vkwopf" Then
+        OpfKeyForCapacity = "VK"
+        Exit Function
+    End If
+
+    If Left$(s, 5) = "ewopf" Then
+        OpfKeyForCapacity = "EW"
+        Exit Function
+    End If
+
+    'Default: use the normal OPF parser
+    OpfKeyForCapacity = OpfCodeFromConstraint(cname)
+End Function
+
+Private Function OpfCodeFromConstraint(ByVal cname As String) As String
+    'Maps leading tokens to OPF codes used in PRODUCT_TYPE and buffers/caps tables.
+    Dim s As String: s = LCase$(Trim$(cname))
+
+    If Left$(s, 5) = "ccopf" Then OpfCodeFromConstraint = "CC": Exit Function
+    If Left$(s, 5) = "cbopf" Then OpfCodeFromConstraint = "CB": Exit Function
+    If Left$(s, 5) = "ewopf" Then OpfCodeFromConstraint = "EL": Exit Function
+
+    'Solomon OPFs
+    If Left$(s, 9) = "sol_ftopf" Then OpfCodeFromConstraint = "FT": Exit Function
+    If Left$(s, 10) = "sol_vkwopf" Then OpfCodeFromConstraint = "KG": Exit Function
+
+    'Fallback: take letters up to "opf"
+    Dim pos As Long: pos = InStr(1, s, "opf", vbTextCompare)
+    If pos > 1 Then
+        OpfCodeFromConstraint = UCase$(Left$(s, pos - 1))
+    Else
+        OpfCodeFromConstraint = ""
+    End If
+End Function
+
+Private Function ProductCodeFromConstraint(ByVal cname As String) As String
+    Dim s As String: s = UCase$(cname)
+
+    'CB special case: if both FB and FL appear, force FB
+    If Left$(LCase$(Trim$(cname)), 5) = "cbopf" Then
+        If InStr(1, s, "FB", vbTextCompare) > 0 And InStr(1, s, "FL", vbTextCompare) > 0 Then
+            ProductCodeFromConstraint = "FB"
+            Exit Function
+        End If
+    End If
+
+    'Normal detection (prefer code closest to end)
+    Dim codes As Variant
+    codes = Array("FB", "SS", "LG", "FL", "KF", "WP")
+
+    Dim bestPos As Long: bestPos = 0
+    Dim bestCode As String: bestCode = ""
+
+    Dim i As Long
+    For i = LBound(codes) To UBound(codes)
+        Dim c As String: c = CStr(codes(i))
+        Dim p As Long: p = InStrRev(s, "_" & c)
+        If p = 0 Then p = InStrRev(s, c & "_")
+        If p = 0 Then p = InStrRev(s, c & ",")
+        If p = 0 Then p = InStrRev(s, c & " ")
+        If p > bestPos Then
+            bestPos = p
+            bestCode = c
+        End If
+    Next i
+
+    ProductCodeFromConstraint = bestCode
+End Function
+
+
+Private Function CanonElement(ByVal raw As String) As String
+    raw = UCase$(Trim$(raw))
+    Select Case raw
+        Case "FE": CanonElement = "FE"
+        Case "SI", "SIO2": CanonElement = "SI"
+        Case "AL", "AL2O3": CanonElement = "AL"
+        Case "MN": CanonElement = "MN"
+        Case "P": CanonElement = "P"
+        Case Else: CanonElement = ""
+    End Select
+End Function
+
+Private Function SumTorValueForPeriod(ByRef ctx As PopulateContext, ByVal per As Long) As Double
+    Dim sumV As Double: sumV = 0#
+    Dim k As Variant
+    For Each k In ctx.torValue.Keys
+        'key is productType|period
+        If Right$(CStr(k), Len("|" & CStr(per))) = "|" & CStr(per) Then
+            sumV = sumV + CDbl(ctx.torValue(k))
+        End If
+    Next k
+    SumTorValueForPeriod = sumV
+End Function
+
+Private Function ExtractBetween(ByVal s As String, ByVal leftTok As String, ByVal rightTok As String) As String
+    Dim a As Long: a = InStr(1, s, leftTok, vbTextCompare)
+    If a = 0 Then Exit Function
+    a = a + Len(leftTok)
+    Dim b As Long: b = InStr(a, s, rightTok, vbTextCompare)
+    If b = 0 Then Exit Function
+    ExtractBetween = Mid$(s, a, b - a)
+End Function
+
+Private Function NzNum(ByVal v As Variant) As Double
+    If IsError(v) Then NzNum = 0#: Exit Function
+    If IsEmpty(v) Or v = vbNullString Then NzNum = 0#: Exit Function
+    If IsNumeric(v) Then NzNum = CDbl(v) Else NzNum = 0#
+End Function
+
+
+'========================
+' HELPERS: tables + logging
+'========================
+Private Function GetTable(ByVal wb As Workbook, ByVal tableName As String) As ListObject
+    Dim ws As Worksheet, lo As ListObject
+    For Each ws In wb.Worksheets
+        For Each lo In ws.ListObjects
+            If StrComp(lo.Name, tableName, vbTextCompare) = 0 Then
+                Set GetTable = lo
+                Exit Function
+            End If
+        Next lo
+    Next ws
+    Set GetTable = Nothing
+End Function
+
+Private Function ColIndex(ByVal lo As ListObject, ByVal headerName As String) As Long
+    Dim i As Long
+    For i = 1 To lo.ListColumns.Count
+        If StrComp(Trim$(lo.ListColumns(i).Name), headerName, vbTextCompare) = 0 Then
+            ColIndex = i
+            Exit Function
+        End If
+    Next i
+    Err.Raise vbObjectError + 513, "ColIndex", "Header not found in table " & lo.Name & ": " & headerName
+End Function
+
+Private Sub LogMsg(ByVal wb As Workbook, ByVal constraintName As String, ByVal msg As String)
+    Dim ws As Worksheet
+    On Error Resume Next
+    Set ws = wb.Worksheets(LOG_SHEET)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Set ws = wb.Worksheets.Add(After:=wb.Worksheets(wb.Worksheets.Count))
+        ws.Name = LOG_SHEET
+        ws.Range("A1:C1").Value = Array("Timestamp", "ConstraintName", "Message")
+    End If
+
+    Dim r As Long
+    r = ws.Cells(ws.Rows.Count, 1).End(xlUp).Row + 1
+    ws.Cells(r, 1).Value = Now
+    ws.Cells(r, 2).Value = constraintName
+    ws.Cells(r, 3).Value = msg
+End Sub
+

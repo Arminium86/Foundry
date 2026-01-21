@@ -324,12 +324,14 @@ NextRow:
     i = 0
     Dim key As Variant
     For Each key In sums.Keys
-        i = i + 1
         Dim parts() As String
         parts = Split(CStr(key), "|")
 
         Dim opfKey As String
         opfKey = UCase$(parts(1))
+        If opfKey = "" Then GoTo NextKey
+
+        i = i + 1
         Dim brandKey As String
         brandKey = UCase$(parts(2))
         Dim periodKey As Long
@@ -354,15 +356,19 @@ NextRow:
         Else
             absTotal = (baseVal2 * perfPct) + (baseVal2 * addPct)
         End If
+        absTotal = absTotal * -1#
 
         outArr(i, cScenario) = parts(0)
         outArr(i, cOPF) = opfKey
         outArr(i, cBrand) = brandKey
         outArr(i, cPer) = periodKey
         outArr(i, cAbs) = absTotal
+NextKey:
     Next key
 
-    lo.HeaderRowRange.Offset(1, 0).Resize(UBound(outArr, 1), lo.ListColumns.Count).Value = outArr
+    If i = 0 Then Exit Sub
+
+    lo.HeaderRowRange.Offset(1, 0).Resize(i, lo.ListColumns.Count).Value = outArr
     lo.ListColumns(cAbs).DataBodyRange.NumberFormat = "#,##0"
 End Sub
 
@@ -437,7 +443,9 @@ Private Sub AppendBufferAbsExportPerScenario(ByVal wb As Workbook, ByVal wsCombi
         Dim r As Long
         For r = 1 To bufRows
             If StrComp(CStr(arr(r, cScenario)), CStr(scen), vbTextCompare) = 0 Then
-                matched = matched + 1
+                If Trim$(CStr(arr(r, cOPF))) <> "" Then
+                    matched = matched + 1
+                End If
             End If
         Next r
         If matched = 0 Then GoTo NextScenario
@@ -454,11 +462,10 @@ Private Sub AppendBufferAbsExportPerScenario(ByVal wb As Workbook, ByVal wsCombi
 
             Dim opfRaw As String
             opfRaw = Trim$(CStr(arr(r, cOPF)))
+            If opfRaw = "" Then GoTo NextBufRow
 
             Dim opfCodeVal As String
-            If opfRaw = "" Then
-                opfCodeVal = vbNullString
-            ElseIf dictMap.Exists(opfRaw) Then
+            If dictMap.Exists(opfRaw) Then
                 opfCodeVal = CStr(dictMap(opfRaw))
             Else
                 ' If it isn't in mapping, keep the raw bucket (better than blank for diagnostics)

@@ -260,6 +260,8 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
         br2 = UCase$(Trim$(CStr(brand2Arr(r, 1))))
         If br2 = "" Then GoTo NextRow
 
+        If br <> "FL" And br2 <> br Then GoTo NextRow
+
         Dim per As Long
         per = CLng(Val(yearArr(r, 1)))
         If per <= 0 Then GoTo NextRow

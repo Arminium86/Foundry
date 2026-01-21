@@ -258,9 +258,11 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
         per = CLng(Val(yearArr(r, 1)))
         If per <= 0 Then GoTo NextRow
 
+        If br = "WASTE" Then GoTo NextRow
+
         Dim baseVal As Double
         If br = "FL" Then
-            baseVal = NzNum(twLArr(r, 1))
+            baseVal = NzNum(twFArr(r, 1)) + NzNum(twLArr(r, 1))
         Else
             baseVal = NzNum(twFArr(r, 1))
         End If
@@ -337,25 +339,21 @@ NextRow:
         addPct = 0#
         If addBuf.Exists(opfKey) Then addPct = NormalizePct(addBuf(opfKey))
 
-        Dim closeAbs As Double
-        closeAbs = 0#
-        If periodKey = 1 Then
-            Dim closeKey As String
-            closeKey = opfKey & brandKey
-            If closingBuf.Exists(closeKey) Then closeAbs = CDbl(closingBuf(closeKey))
-        End If
-
         Dim baseVal2 As Double
         baseVal2 = CDbl(sums(key))
 
-        Dim absPerfect As Double
-        absPerfect = baseVal2 * perfPct
-
-        Dim absAdd As Double
-        absAdd = (baseVal2 + absPerfect) * addPct
-
         Dim absTotal As Double
-        absTotal = -(closeAbs + absPerfect + absAdd)
+        If periodKey = 1 Then
+            Dim closeAbs As Double
+            closeAbs = 0#
+            Dim closeKey As String
+            closeKey = opfKey & brandKey
+            If closingBuf.Exists(closeKey) Then closeAbs = CDbl(closingBuf(closeKey))
+
+            absTotal = closeAbs + (baseVal2 * addPct)
+        Else
+            absTotal = (baseVal2 * perfPct) + (baseVal2 * addPct)
+        End If
 
         outArr(i, cScenario) = parts(0)
         outArr(i, cOPF) = opfKey

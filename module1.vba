@@ -209,17 +209,17 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
     Const SH_BUF As String = "Buffers & OPF Physical Caps"
     Const TBL_BUF As String = "Buffer_Abs_Export"
 
-    Dim colScenario As Long, colOpfCode As Long, colBrand As Long, colYear As Long
+    Dim colScenario As Long, colOpfCode As Long, colBrand2 As Long, colYear As Long
     Dim colTwF As Long, colTwL As Long
 
     colScenario = FindHeaderColumn(wsCombined, "Scenario")
     colOpfCode = FindHeaderColumn(wsCombined, "OPF Code")
-    colBrand = FindHeaderColumn(wsCombined, "brand")
+    colBrand2 = FindHeaderColumn(wsCombined, "brand2")
     colYear = FindHeaderColumn(wsCombined, "year")
     colTwF = FindHeaderColumn(wsCombined, "port_tw@f")
     colTwL = FindHeaderColumn(wsCombined, "port_tw@l")
 
-    If colScenario = 0 Or colOpfCode = 0 Or colBrand = 0 Or colYear = 0 Or colTwF = 0 Or colTwL = 0 Then
+    If colScenario = 0 Or colOpfCode = 0 Or colBrand2 = 0 Or colYear = 0 Or colTwF = 0 Or colTwL = 0 Then
         Err.Raise vbObjectError + 150, , "Combined sheet missing required columns for abs buffer calc."
     End If
 
@@ -231,7 +231,7 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
     Dim yearArr As Variant, twFArr As Variant, twLArr As Variant
     scenArr = wsCombined.Range(wsCombined.Cells(2, colScenario), wsCombined.Cells(lastRow, colScenario)).Value2
     opfArr = wsCombined.Range(wsCombined.Cells(2, colOpfCode), wsCombined.Cells(lastRow, colOpfCode)).Value2
-    brandArr = wsCombined.Range(wsCombined.Cells(2, colBrand), wsCombined.Cells(lastRow, colBrand)).Value2
+    brandArr = wsCombined.Range(wsCombined.Cells(2, colBrand2), wsCombined.Cells(lastRow, colBrand2)).Value2
     yearArr = wsCombined.Range(wsCombined.Cells(2, colYear), wsCombined.Cells(lastRow, colYear)).Value2
     twFArr = wsCombined.Range(wsCombined.Cells(2, colTwF), wsCombined.Cells(lastRow, colTwF)).Value2
     twLArr = wsCombined.Range(wsCombined.Cells(2, colTwL), wsCombined.Cells(lastRow, colTwL)).Value2
@@ -349,7 +349,7 @@ NextRow:
             Dim closeAbs As Double
             closeAbs = 0#
             Dim closeKey As String
-            closeKey = opfKey & brandKey
+            closeKey = MapClosingBufferOpf(opfKey) & brandKey
             If closingBuf.Exists(closeKey) Then closeAbs = CDbl(closingBuf(closeKey))
 
             absTotal = closeAbs + (baseVal2 * addPct)
@@ -666,6 +666,20 @@ Private Function NormalizePct(ByVal v As Variant) As Double
     pct = NzNum(v)
     If pct > 1# Then pct = pct / 100#
     NormalizePct = pct
+End Function
+
+Private Function MapClosingBufferOpf(ByVal opfKey As String) As String
+    Dim normalized As String
+    normalized = UCase$(Trim$(opfKey))
+
+    Select Case normalized
+        Case "VK"
+            MapClosingBufferOpf = "KG"
+        Case "EW"
+            MapClosingBufferOpf = "EL"
+        Case Else
+            MapClosingBufferOpf = normalized
+    End Select
 End Function
 
 ' Values-only "last header col" (fixes phantom / formatting / table expansion issues)

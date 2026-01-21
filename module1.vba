@@ -209,17 +209,18 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
     Const SH_BUF As String = "Buffers & OPF Physical Caps"
     Const TBL_BUF As String = "Buffer_Abs_Export"
 
-    Dim colScenario As Long, colOpfCode As Long, colBrand2 As Long, colYear As Long
+    Dim colScenario As Long, colOpfCode As Long, colBrand As Long, colBrand2 As Long, colYear As Long
     Dim colTwF As Long, colTwL As Long
 
     colScenario = FindHeaderColumn(wsCombined, "Scenario")
     colOpfCode = FindHeaderColumn(wsCombined, "OPF Code")
+    colBrand = FindHeaderColumn(wsCombined, "brand")
     colBrand2 = FindHeaderColumn(wsCombined, "brand2")
     colYear = FindHeaderColumn(wsCombined, "year")
     colTwF = FindHeaderColumn(wsCombined, "port_tw@f")
     colTwL = FindHeaderColumn(wsCombined, "port_tw@l")
 
-    If colScenario = 0 Or colOpfCode = 0 Or colBrand2 = 0 Or colYear = 0 Or colTwF = 0 Or colTwL = 0 Then
+    If colScenario = 0 Or colOpfCode = 0 Or colBrand = 0 Or colBrand2 = 0 Or colYear = 0 Or colTwF = 0 Or colTwL = 0 Then
         Err.Raise vbObjectError + 150, , "Combined sheet missing required columns for abs buffer calc."
     End If
 
@@ -227,11 +228,12 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
     lastRow = wsCombined.Cells(wsCombined.Rows.Count, colScenario).End(xlUp).Row
     If lastRow < 2 Then Exit Sub
 
-    Dim scenArr As Variant, opfArr As Variant, brandArr As Variant
+    Dim scenArr As Variant, opfArr As Variant, brandArr As Variant, brand2Arr As Variant
     Dim yearArr As Variant, twFArr As Variant, twLArr As Variant
     scenArr = wsCombined.Range(wsCombined.Cells(2, colScenario), wsCombined.Cells(lastRow, colScenario)).Value2
     opfArr = wsCombined.Range(wsCombined.Cells(2, colOpfCode), wsCombined.Cells(lastRow, colOpfCode)).Value2
-    brandArr = wsCombined.Range(wsCombined.Cells(2, colBrand2), wsCombined.Cells(lastRow, colBrand2)).Value2
+    brandArr = wsCombined.Range(wsCombined.Cells(2, colBrand), wsCombined.Cells(lastRow, colBrand)).Value2
+    brand2Arr = wsCombined.Range(wsCombined.Cells(2, colBrand2), wsCombined.Cells(lastRow, colBrand2)).Value2
     yearArr = wsCombined.Range(wsCombined.Cells(2, colYear), wsCombined.Cells(lastRow, colYear)).Value2
     twFArr = wsCombined.Range(wsCombined.Cells(2, colTwF), wsCombined.Cells(lastRow, colTwF)).Value2
     twLArr = wsCombined.Range(wsCombined.Cells(2, colTwL), wsCombined.Cells(lastRow, colTwL)).Value2
@@ -248,27 +250,35 @@ Private Sub PopulateBufferAbsExportFromResults(ByVal wb As Workbook, ByVal wsCom
 
         Dim opf As String
         opf = Trim$(CStr(opfArr(r, 1)))
-        If opf = "" Then GoTo NextRow
+        If opf = "" Or UCase$(opf) = "BLANK" Then GoTo NextRow
 
         Dim br As String
         br = UCase$(Trim$(CStr(brandArr(r, 1))))
         If br = "" Then GoTo NextRow
 
+        Dim br2 As String
+        br2 = UCase$(Trim$(CStr(brand2Arr(r, 1))))
+        If br2 = "" Then GoTo NextRow
+
         Dim per As Long
         per = CLng(Val(yearArr(r, 1)))
         If per <= 0 Then GoTo NextRow
 
-        If br = "WASTE" Then GoTo NextRow
+        If br = "WASTE" Or br2 = "WASTE" Then GoTo NextRow
 
         Dim baseVal As Double
         If br = "FL" Then
-            baseVal = NzNum(twFArr(r, 1)) + NzNum(twLArr(r, 1))
+            If br2 = "FL" Then
+                baseVal = NzNum(twLArr(r, 1))
+            Else
+                baseVal = NzNum(twFArr(r, 1))
+            End If
         Else
             baseVal = NzNum(twFArr(r, 1))
         End If
 
         Dim k As String
-        k = scen & "|" & opf & "|" & br & "|" & CStr(per)
+        k = scen & "|" & opf & "|" & br2 & "|" & CStr(per)
         If sums.Exists(k) Then
             sums(k) = CDbl(sums(k)) + baseVal
         Else

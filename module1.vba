@@ -188,6 +188,19 @@ NextName:
         Application.DisplayAlerts = False
         wbTmp.SaveAs Filename:=CStr(savePath), FileFormat:=xlCSVUTF8
         Application.DisplayAlerts = True
+
+        Dim exportFolder As String
+        exportFolder = GetFolderPath(CStr(savePath))
+
+        Dim baseName As String
+        baseName = GetFileBaseName(CStr(savePath))
+
+        ExportTableToCsv ThisWorkbook, "TOR OPF Targets", "TOR_OPF_Targets", exportFolder, _
+            baseName & "_TOR_OPF_Targets.csv"
+        ExportTableToCsv ThisWorkbook, "2YP OPF Production", "OPF_Production_2YP", exportFolder, _
+            baseName & "_OPF_Production_2YP.csv"
+        ExportTableToCsv ThisWorkbook, "TAG Shipping Specs", "TAG_Shipping_Specs", exportFolder, _
+            baseName & "_TAG_Shipping_Specs.csv"
     End If
 
     wbTmp.Close SaveChanges:=False
@@ -747,6 +760,78 @@ End Function
 Private Function GetDesktopPath() As String
     GetDesktopPath = CreateObject("WScript.Shell").SpecialFolders("Desktop")
 End Function
+
+Private Function GetFolderPath(ByVal filePath As String) As String
+    Dim pos As Long
+    pos = InStrRev(filePath, "\")
+    If pos > 0 Then
+        GetFolderPath = Left$(filePath, pos - 1)
+    Else
+        GetFolderPath = vbNullString
+    End If
+End Function
+
+Private Function GetFileBaseName(ByVal filePath As String) As String
+    Dim fileName As String
+    fileName = Mid$(filePath, InStrRev(filePath, "\") + 1)
+
+    Dim dotPos As Long
+    dotPos = InStrRev(fileName, ".")
+    If dotPos > 0 Then
+        GetFileBaseName = Left$(fileName, dotPos - 1)
+    Else
+        GetFileBaseName = fileName
+    End If
+End Function
+
+Private Sub ExportTableToCsv(ByVal wb As Workbook, ByVal sheetName As String, ByVal tableName As String, _
+                             ByVal folderPath As String, ByVal outputFileName As String)
+    Dim ws As Worksheet
+    Dim lo As ListObject
+    Dim wbOut As Workbook
+    Dim wsOut As Worksheet
+    Dim prevAlerts As Boolean
+
+    If folderPath = vbNullString Then
+        Err.Raise vbObjectError + 301, , "Export folder path missing for table " & tableName & "."
+    End If
+
+    On Error Resume Next
+    Set ws = wb.Worksheets(sheetName)
+    If Not ws Is Nothing Then Set lo = ws.ListObjects(tableName)
+    On Error GoTo 0
+
+    If ws Is Nothing Then
+        Err.Raise vbObjectError + 302, , "Sheet not found: " & sheetName
+    End If
+    If lo Is Nothing Then
+        Err.Raise vbObjectError + 303, , "Table not found: " & tableName
+    End If
+
+    prevAlerts = Application.DisplayAlerts
+    On Error GoTo CleanFail
+
+    Set wbOut = Workbooks.Add(xlWBATWorksheet)
+    Set wsOut = wbOut.Worksheets(1)
+    wsOut.Cells.Clear
+
+    Dim srcRange As Range
+    Set srcRange = lo.Range
+    wsOut.Range(wsOut.Cells(1, 1), wsOut.Cells(srcRange.Rows.Count, srcRange.Columns.Count)).Value2 = _
+        srcRange.Value2
+
+    Application.DisplayAlerts = False
+    wbOut.SaveAs Filename:=folderPath & "\" & outputFileName, FileFormat:=xlCSVUTF8
+    Application.DisplayAlerts = prevAlerts
+
+    wbOut.Close SaveChanges:=False
+    Exit Sub
+
+CleanFail:
+    Application.DisplayAlerts = prevAlerts
+    If Not wbOut Is Nothing Then wbOut.Close SaveChanges:=False
+    Err.Raise Err.Number, Err.Source, Err.Description
+End Sub
 
 Private Function GetLoColIndexAny(ByVal lo As ListObject, ByVal headers As Variant) As Long
     Dim i As Long, h As Variant

@@ -6,23 +6,67 @@ Option Explicit
 Public Sub ExportCombinedCSV_WithOPFCode_Scenario_DynamicMapping()
 
     Dim wsList As Worksheet, ws As Worksheet
-    Dim rng As Range, c As Range
     Dim shName As String
 
     Set wsList = ActiveSheet
-    Set rng = wsList.Range("A2:A11")   ' sheet names (controller)
 
-    ' ---- Build OPF -> OPF Code mapping from C3:D20 ----
+    Dim loScenario As ListObject
+    On Error Resume Next
+    Set loScenario = wsList.ListObjects("Scenario_List")
+    On Error GoTo 0
+    If loScenario Is Nothing Then
+        Err.Raise vbObjectError + 900, , "Table 'Scenario_List' not found on active sheet."
+    End If
+    If loScenario.DataBodyRange Is Nothing Then
+        Err.Raise vbObjectError + 901, , "Table 'Scenario_List' has no data."
+    End If
+    If loScenario.ListColumns.Count < 2 Then
+        Err.Raise vbObjectError + 902, , "Table 'Scenario_List' must have at least two columns."
+    End If
+
+    Dim scenTableArr As Variant
+    scenTableArr = loScenario.DataBodyRange.Value2
+
+    Dim scenNumHeader As String
+    scenNumHeader = Trim$(CStr(loScenario.ListColumns(2).Name))
+    If scenNumHeader = vbNullString Then scenNumHeader = "Scenario Integer"
+
+    Dim scenNumByName As Object
+    Set scenNumByName = CreateObject("Scripting.Dictionary")
+    scenNumByName.CompareMode = vbTextCompare
+
+    ' ---- Build OPF -> OPF Code mapping from OPF_Code table ----
     Dim dictMap As Object
     Set dictMap = CreateObject("Scripting.Dictionary")
     dictMap.CompareMode = vbTextCompare
 
-    Dim mapCell As Range
-    For Each mapCell In wsList.Range("C3:C20").Cells
-        If Trim$(CStr(mapCell.Value2)) <> "" And Trim$(CStr(mapCell.Offset(0, 1).Value2)) <> "" Then
-            dictMap(Trim$(CStr(mapCell.Value2))) = Trim$(CStr(mapCell.Offset(0, 1).Value2))
+    Dim loOpf As ListObject
+    On Error Resume Next
+    Set loOpf = wsList.ListObjects("OPF_Code")
+    On Error GoTo 0
+    If loOpf Is Nothing Then
+        Err.Raise vbObjectError + 903, , "Table 'OPF_Code' not found on active sheet."
+    End If
+    If loOpf.DataBodyRange Is Nothing Then
+        Err.Raise vbObjectError + 904, , "Table 'OPF_Code' has no data."
+    End If
+    If loOpf.ListColumns.Count < 2 Then
+        Err.Raise vbObjectError + 905, , "Table 'OPF_Code' must have at least two columns."
+    End If
+
+    Dim opfArr As Variant
+    opfArr = loOpf.DataBodyRange.Value2
+
+    Dim mapRow As Long
+    For mapRow = 1 To UBound(opfArr, 1)
+        Dim opfKey As String
+        Dim opfCode As String
+        opfKey = Trim$(CStr(opfArr(mapRow, 1)))
+        opfCode = Trim$(CStr(opfArr(mapRow, 2)))
+        If opfKey <> "" And opfCode <> "" Then
+            dictMap(opfKey) = opfCode
         End If
-    Next mapCell
+    Next mapRow
 
     ' Track scenarios actually combined
     Dim scenUsed As Object
@@ -48,9 +92,11 @@ Public Sub ExportCombinedCSV_WithOPFCode_Scenario_DynamicMapping()
     Dim headerCols As Long
 
     ' ---- 1) COMBINE DATA + SCENARIO (STRICT header width based on VALUES ONLY) ----
-    For Each c In rng.Cells
-        shName = Trim$(CStr(c.Value2))
+    Dim scenRow As Long
+    For scenRow = 1 To UBound(scenTableArr, 1)
+        shName = Trim$(CStr(scenTableArr(scenRow, 1)))
         If shName = "" Then GoTo NextName
+        scenNumByName(shName) = scenTableArr(scenRow, 2)
 
         Set ws = Nothing
         On Error Resume Next
@@ -75,6 +121,7 @@ Public Sub ExportCombinedCSV_WithOPFCode_Scenario_DynamicMapping()
                 ws.Range(ws.Cells(1, 1), ws.Cells(1, headerCols)).Value2
 
             wsTmp.Cells(outRow, headerCols + 1).Value2 = "Scenario"
+            wsTmp.Cells(outRow, headerCols + 2).Value2 = scenNumHeader
             outRow = outRow + 1
             headerWritten = True
         End If
@@ -84,16 +131,23 @@ Public Sub ExportCombinedCSV_WithOPFCode_Scenario_DynamicMapping()
         takeCols = headerCols
         If thisHeaderCols < takeCols Then takeCols = thisHeaderCols
 
-        Dim dataArr As Variant, scenArr() As Variant, i As Long
+        Dim dataArr As Variant, scenArr() As Variant, scenNumArr() As Variant, i As Long
         dataArr = ws.Range(ws.Cells(2, 1), ws.Cells(lastRow, takeCols)).Value2
         ReDim scenArr(1 To UBound(dataArr, 1), 1 To 1)
+        ReDim scenNumArr(1 To UBound(dataArr, 1), 1 To 1)
 
         For i = 1 To UBound(scenArr, 1)
             scenArr(i, 1) = shName
+            If scenNumByName.Exists(shName) Then
+                scenNumArr(i, 1) = scenNumByName(shName)
+            Else
+                scenNumArr(i, 1) = vbNullString
+            End If
         Next i
 
         wsTmp.Range(wsTmp.Cells(outRow, 1), wsTmp.Cells(outRow + UBound(dataArr, 1) - 1, takeCols)).Value2 = dataArr
         wsTmp.Range(wsTmp.Cells(outRow, headerCols + 1), wsTmp.Cells(outRow + UBound(scenArr, 1) - 1, headerCols + 1)).Value2 = scenArr
+        wsTmp.Range(wsTmp.Cells(outRow, headerCols + 2), wsTmp.Cells(outRow + UBound(scenNumArr, 1) - 1, headerCols + 2)).Value2 = scenNumArr
 
         outRow = outRow + UBound(dataArr, 1)
 
@@ -101,7 +155,7 @@ Public Sub ExportCombinedCSV_WithOPFCode_Scenario_DynamicMapping()
 
 NextName:
         Set ws = Nothing
-    Next c
+    Next scenRow
 
     If Not headerWritten Then Err.Raise vbObjectError + 1, , "No valid sheets found."
 
